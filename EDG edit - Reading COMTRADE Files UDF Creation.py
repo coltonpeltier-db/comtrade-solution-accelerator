@@ -1,15 +1,5 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC 
-# MAGIC #### This notebook merges the codebase from `Create_Comtrade_Files` and `Model Creation` using the s3 bucket as source data.
-
-# COMMAND ----------
-
-# MAGIC %fs ls "s3://db-gtm-industry-solutions/data/rcg/comtrade/transient disturbances/transient disturbances/"
-
-# COMMAND ----------
-
-# MAGIC %md
 # MAGIC Install the <a href="https://github.com/dparrini/python-comtrade">`python-comtrade`</a>, <a href="https://github.com/ijl/orjson">`orjson`</a>, <a href="https://github.com/relihanl/comtradehandlers">`ComtradeHandlers`</a> libraries via pip.
 
 # COMMAND ----------
@@ -44,6 +34,7 @@ import pyspark.sql.functions as F
 from pyspark.sql.functions import pandas_udf, udf
 from pyspark.sql import DataFrame
 from pyspark.sql.types import BinaryType, StringType, StructType, StructField, ArrayType, DoubleType, MapType, TimestampType, IntegerType, LongType
+from joblib import Parallel, delayed
 
 # COMMAND ----------
 
@@ -126,33 +117,15 @@ TIME = "time"
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # Download COMTRADE Dataset
+# MAGIC # Data
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Raw Data (this'll prob be an edit or zap??)
-# MAGIC Download the <a href="https://ieee-dataport.org/open-access/transients-and-faults-power-transformers-and-phase-angle-regulators-dataset">*"Transients and Faults in Power Transformers and Phase Angle Regulators”* dataset from the IEEE Dataport</a>. You'll need to create a free IEEE account to do so.
+# MAGIC ## Raw Data
+# MAGIC The dataset in the s3 path is from <a href="https://ieee-dataport.org/open-access/transients-and-faults-power-transformers-and-phase-angle-regulators-dataset">*"Transients and Faults in Power Transformers and Phase Angle Regulators”* dataset from the IEEE Dataport</a>. You can download it directly from the link by creating a free IEEE account first. Otherwise, you can use the files in our s3 bucket.
 # MAGIC 
 # MAGIC The dataset consists of a few thousand simulated examples of various power quality transient events. They are formatted as flat text files. In order to showcase the solution acclerator, we'll need to convert them to COMTRADE files using the installed `ComtradeHandlers` library.
-# MAGIC 
-# MAGIC After downloading the .zip file, unzip it locally on your computer and upload the underlying files and folders to your databricks workspace using the **Data Explorer** or <a href="https://docs.databricks.com/dev-tools/cli/index.html">CLI</a> and specify the location of the files in the below `folder_location_ieee_zip_contents` variable.
-# MAGIC 
-# MAGIC As an example here are the CLI commands I executed from my computer to create the desired directory and upload the files and folders:
-# MAGIC 
-# MAGIC ```
-# MAGIC $ databricks fs mkdirs dbfs:/FileStore/power_quality_transients --profile mlpractice
-# MAGIC $ databricks fs cp -r "Dataset for Transformer & PAR transients" dbfs:/FileStore/power_quality_transients --profile mlpractice
-# MAGIC ```
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # Read COMTRADE files into Spark
-# MAGIC 
-# MAGIC * Read COMTRADE `.cfg` and `.dat` files as binary 
-# MAGIC * Convert the `.cfg` file contents to string. The `.dat` file contents are left as binary because some `.dat` files will be binary type while others will be ASCII strings. We don't know for each file yet which type it is until we examine the associated `.cfg` file.
-# MAGIC * Join together on the filename.
 
 # COMMAND ----------
 
@@ -172,10 +145,30 @@ all_txt_files = [p.path for p in list(deep_ls(S3_COMTRADE_DATA_PATH))]
 
 # COMMAND ----------
 
-if os.path.exists(SAVE_PATH_PREFIX):
+# MAGIC %md
+# MAGIC If necessary, create a new directory to store the newly created COMTRADE files.
+
+# COMMAND ----------
+
+def file_exists(dir):
+  try:
+    dbutils.fs.ls(dir)
+  except:
+    return False  
+  return True
+
+# COMMAND ----------
+
+if file_exists(SAVE_PATH_PREFIX.replace("/dbfs",  "dbfs:")):
   print("This directory exists already.")
 else:
   dbutils.fs.mkdirs(SAVE_PATH_PREFIX.replace("/dbfs",  "dbfs:"))
+  print("Directory created successfully.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Read the data from s3 and use the `ComtradeHandlers` library to write out the data as comtrade files in local dbfs.
 
 # COMMAND ----------
 
@@ -213,23 +206,53 @@ def read_txt_file_to_pd(file_path : str) -> pd.DataFrame:
 
 # COMMAND ----------
 
-for txt_file_path in all_txt_files:
-    fn = all_txt_files[0].split("/")[-1].split(".")[0] # get the filename with no extension or path.
+# MAGIC %md
+# MAGIC Process the txt files into COMTRADE files. This is using parallelism (which you can configure in the `n_jobs` argument below) to speed up the process, but this can still take quite some time!
+
+# COMMAND ----------
+
+def txt_file_generator(all_txt_files):
+    _all_txt = all_txt_files
+    _n = 0
+    while _n < len(_all_txt):
+        yield _all_txt[_n]
+        _n += 1
+
+def process_file(txt_file_path):
+    _path_prefix = all_txt_files[0].split("/")[-1].split(".")[0] # get the filename with no extension or path.
     uuid_suffix = str(uuid.uuid4()).split("-")[-1]
     _tmp = read_txt_file_to_pd(txt_file_path)
-    write_comtrade_file(fn + uuid_suffix, fn, randint(0,9999), _tmp)
+    write_comtrade_file(_path_prefix + uuid_suffix, _path_prefix, randint(0,9999), _tmp)
     print(f"Processing: {txt_file_path}")
 
+Parallel(n_jobs=16, prefer="threads")(delayed(process_file)(txt_file) for txt_file in txt_file_generator(all_txt_files))
+
 # COMMAND ----------
+
+# MAGIC %md
+# MAGIC Load and plot an example waveform
+
+# COMMAND ----------
+
+example_path = dbutils.fs.ls(SAVE_PATH_PREFIX.replace("/dbfs",  "dbfs:"))[0].path.split(".")[0].replace("dbfs:","/dbfs")
 
 rec = Comtrade()
-rec.load(f"{SAVE_PATH_PREFIX}/{fn + uuid_suffix}.cfg", f"{SAVE_PATH_PREFIX}/{fn + uuid_suffix}.dat")
-
-# COMMAND ----------
+rec.load(f"{example_path}.cfg", f"{example_path}.dat")
 
 plt.plot(rec.analog[0])
 plt.plot(rec.analog[1])
 plt.plot(rec.analog[2])
+
+plt.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Read COMTRADE files into Spark
+# MAGIC 
+# MAGIC * Read COMTRADE `.cfg` and `.dat` files as binary 
+# MAGIC * Convert the `.cfg` file contents to string. The `.dat` file contents are left as binary because some `.dat` files will be binary type while others will be ASCII strings. We don't know for each file yet which type it is until we examine the associated `.cfg` file.
+# MAGIC * Join together on the filename.
 
 # COMMAND ----------
 
@@ -275,7 +298,7 @@ display(joined_comtrade)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # Using the `comtrade` library to parse file pairs
+# MAGIC ## Using the `comtrade` library to parse file pairs
 # MAGIC 
 # MAGIC The `comtrade` library is typically used by creating a new `comtrade.Comtrade` object and calling `.load()` and specifying the path to the `.cfg` and `.dat` files:
 # MAGIC 
@@ -413,7 +436,7 @@ json_retrieved.show()
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # Parsing the JSON
+# MAGIC ## Parsing the JSON
 # MAGIC Great! Now we have some binary JSON, but how can we use it? First we'll define a Spark schema, then we'll use Spark's `from_json` function to parse the JSON.
 
 # COMMAND ----------
@@ -448,7 +471,7 @@ proc.show()
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # Pivoting the Data
+# MAGIC ## Pivoting the Data
 # MAGIC We'd like to get columns for IA, IB, IC, the timestamp columns, and keep the metadata columns.
 # MAGIC First, let's create a dataframe of just the metadata, which we'll rejoin to the larger dataset at the end using `FILENAME` as a key.
 
@@ -530,7 +553,6 @@ mlflow.autolog(disable=True)
 
 # COMMAND ----------
 
-dir_path = COMTRADE_FILES_PATH
 TIME = "time"
 PHASE_A = "IA"
 PHASE_B = "IB"
@@ -551,7 +573,7 @@ df = (
     .read
     .schema(raw_schema)
     .option("recursiveFileLookup",True)
-    .csv(dir_path)
+    .csv(S3_COMTRADE_DATA_PATH)
     .withColumn("filename", F.input_file_name())
     .withColumn(IS_FAULT, F.col("filename").rlike("external").cast("int"))
 )
@@ -565,7 +587,58 @@ df_pd = df.toPandas()
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Simple xgboost
+# MAGIC ## Preprocessing
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Test / Train Split
+
+# COMMAND ----------
+
+from sklearn.model_selection import GroupShuffleSplit
+splitter = GroupShuffleSplit(test_size=0.2, n_splits=2, random_state=13)
+split = splitter.split(df_pd, groups=df_pd["filename"])
+train_inds, test_inds = next(split)
+
+train_pd = df_pd.iloc[train_inds]
+test_pd = df_pd.iloc[test_inds]
+
+print(train_pd.shape, test_pd.shape)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Standard Scaling
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Scale the current columns on a similar range.
+
+# COMMAND ----------
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.compose import ColumnTransformer
+
+scale_columns = ["IA","IB","IC"]
+features = train_pd[scale_columns]
+
+scaler = StandardScaler()
+
+scaler.fit(features)
+
+# COMMAND ----------
+
+train_scaled = train_pd.copy()
+train_scaled[scale_columns] = scaler.transform(train_scaled[scale_columns])
+test_scaled = test_pd.copy()
+test_scaled[scale_columns] = scaler.transform(test_scaled[scale_columns])
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Simple xgboost
 
 # COMMAND ----------
 
@@ -575,10 +648,10 @@ import xgboost as xgb
 from sklearn.model_selection import train_test_split
 from sklearn import metrics
 
-G = df_pd.drop(["filename", "is_fault"], axis=1)
-g = df_pd.is_fault
-
-G_train, G_test, g_train, g_test = train_test_split(G, g, test_size=0.33, random_state=42)
+G_train = train_scaled.drop(columns=["filename", "is_fault","time"])
+g_train = train_scaled["is_fault"]
+G_test = test_scaled.drop(columns=["filename", "is_fault","time"])
+g_test = test_scaled["is_fault"]
 
 xgb_model = xgb.XGBClassifier(max_depth=3, subsample=0.5) # to mkae it run a little more snappy
 xgb_model.fit(G_train, g_train)
@@ -590,7 +663,7 @@ metrics.auc(fpr, tpr)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### CNN
+# MAGIC ## CNN
 
 # COMMAND ----------
 
@@ -685,7 +758,6 @@ client.transition_model_version_stage(name = "fault_detection", version=int(regi
 
 # COMMAND ----------
 
-# MAGIC 
 # MAGIC %md
 # MAGIC # What would a data pipeline look like?
 # MAGIC Saving the data should be done in the <a href="https://www.databricks.com/glossary/medallion-architecture">medallion architecture</a>. As such the flow would look like:
@@ -695,120 +767,3 @@ client.transition_model_version_stage(name = "fault_detection", version=int(regi
 # MAGIC * Create silver tables for the flattened data and metadata from the parsed JSON.
 # MAGIC * Perform filtering for the desired columsn and pivot the data into a silver table.
 # MAGIC * Use a trained tensorflow model to detect faults in the waveforms and store the results in a gold table.
-
-# COMMAND ----------
-
-df = spark.table("fault_detection.pivoted_current_silver")
-df.display()
-
-# COMMAND ----------
-
-df.groupby("filename").agg(F.count("*")).display()
-
-# COMMAND ----------
-
-spark.table("fault_detection.comtrade_json_silver").select(F.size("analog")).distinct().show()
-
-# COMMAND ----------
-
-spark.table("fault_detection.comtrade_json_silver").select("filename",F.explode("timestamp").alias("timestamp")).groupby("filename").agg(F.countDistinct("timestamp")).show()
-
-# COMMAND ----------
-
-x = (
-    df
-    .select(F.struct(F.col("timestamp"),F.col("IA"), F.col("IB"), F.col("IC")).alias("timestep"),"filename")
-    .groupby("filename")
-    .agg(
-        F.collect_list(F.col("timestep")).alias("timestep")
-    )
-    .withColumn("timestep", F.array_sort("timestep"))
-    .withColumn("timestep_array", F.transform("timestep", lambda x: F.array(x["IA"],x["IB"],x["IC"])))
-)
-
-# COMMAND ----------
-
-y = x.drop("timestep").limit(10).toPandas()
-
-# COMMAND ----------
-
-import numpy as np
-import matplotlib.pyplot as plt
-result = np.vstack(y["timestep_array"].iloc[0])
-result.shape
-
-# COMMAND ----------
-
-def fault_identification(waveform_pd):
-    # Load model
-    fault_model = mlflow.keras.load_model("models:/fault_detection/Production")
-    wfs = np.vstack(waveform_pd.map(lambda x: np.expand_dims(np.vstack(x),0)).tolist())
-    scores = np.squeeze(fault_model.predict(wfs))
-    return pd.Series(scores)
-
-# COMMAND ----------
-
-fault_identification(y["timestep_array"].iloc[:1]).iloc[0]
-
-# COMMAND ----------
-
-wfs = np.vstack(y["timestep_array"].map(lambda x: np.expand_dims(np.vstack(x),0)).tolist())
-wfs.shape
-
-# COMMAND ----------
-
-import mlflow
-import tensorflow as tf
-fault_model = mlflow.keras.load_model("models:/fault_detection/Production")
-
-# COMMAND ----------
-
-pd.Series(tf.squeeze(fault_model.predict(wfs))).iloc[0]
-
-# COMMAND ----------
-
-plt.plot(result[:,0])
-plt.plot(result[:,1])
-plt.plot(result[:,2])
-
-# COMMAND ----------
-
-import comtrade
-import datetime
-import numpy as np
-
-# COMMAND ----------
-
-_com = comtrade.Comtrade()
-_com.load("/dbfs/FileStore/tables/colton/ieee_transients_comtrade_v3/cap1f_0100047ec92b85.cfg","/dbfs/FileStore/tables/colton/ieee_transients_comtrade_v3/cap1f_0100047ec92b85.dat")
-
-# COMMAND ----------
-
-0.0501 * 1e6
-
-# COMMAND ----------
-
-np.subtract(_com.time[1:], _com.time[:-1])
-
-# COMMAND ----------
-
-dts = [_com.start_timestamp + datetime.timedelta(seconds = fractional_second) for fractional_second in _com.time]
-dts
-
-# COMMAND ----------
-
-[_dt.microsecond for _dt in dts]
-
-# COMMAND ----------
-
-st_60_2048 = (1 / 60 / 2048)
-st_60_2048
-
-# COMMAND ----------
-
-rn = datetime.datetime.now()
-rn + datetime.timedelta(seconds = st_60_2048), rn + 2*datetime.timedelta(seconds = st_60_2048)
-
-# COMMAND ----------
-
-
