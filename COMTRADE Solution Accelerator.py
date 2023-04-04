@@ -36,6 +36,19 @@ from pyspark.sql import DataFrame
 from pyspark.sql.types import BinaryType, StringType, StructType, StructField, ArrayType, DoubleType, MapType, TimestampType, IntegerType, LongType
 from joblib import Parallel, delayed
 
+import tensorflow as tf
+import mlflow
+from mlflow.keras import log_model
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Turn off mlflow logging so that we can manually log and transition our ML model.
+
+# COMMAND ----------
+
+mlflow.autolog(disable=True)
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -80,7 +93,6 @@ CONTENTS_DAT = "dat_content"
 
 # COMMAND ----------
 
-TIME = "timestamp"
 TIME_MILLIS = "time_millis"
 TIME_MICRO = "microseconds"
 VALUE = "value"
@@ -211,8 +223,8 @@ def read_txt_file_to_pd(file_path : str) -> pd.DataFrame:
 
 # COMMAND ----------
 
-def txt_file_generator(all_txt_files):
-    _all_txt = all_txt_files
+def txt_file_generator(gen_txt_files):
+    _all_txt = gen_txt_files
     _n = 0
     while _n < len(_all_txt):
         yield _all_txt[_n]
@@ -399,9 +411,8 @@ def retrieve_dict(cfg : str, dat : bytes) -> str:
     ret[REC_DEV_ID] = _comtrade.rec_dev_id
     ret[STATION_NAME] = _comtrade.station_name
     
-    # Because spark timestamps only go down to the millisecond level, we'll need to track microseconds separately.
-    ret[TIME_MILLIS] = [int(_comtrade.start_timestamp.timestamp()) + int((t * 1e6) // 1e3) for t in _comtrade.time]
-    ret[TIME_MICRO] = [int(second * 1e6 % 1e3) for second in _comtrade.time] # Get the modulus of microseconds to milliseconds
+    # Get microseconds since epoch
+    ret[TIME_MICRO] = [int(_comtrade.start_timestamp.timestamp()) + int(second * 1e6) for second in _comtrade.time]
     
     # Dump the dictionary to a binary string.
     return orjson.dumps(ret)
@@ -431,7 +442,7 @@ json_retrieved = (
     joined_comtrade
     .withColumn("binary_json", get_comtrade_json(F.col("config_content"), F.col("dat_content")))
 )
-json_retrieved.show()
+#json_retrieved.show()
 
 # COMMAND ----------
 
@@ -450,8 +461,7 @@ json_schema = StructType([
     StructField(FREQ, DoubleType()),
     StructField(REC_DEV_ID, StringType()),
     StructField(STATION_NAME, StringType()),
-    StructField(TIME_MILLIS, ArrayType(TimestampType())),
-    StructField(TIME_MICRO, ArrayType(IntegerType()))
+    StructField(TIME_MICRO, ArrayType(LongType()))
 ])
 
 # COMMAND ----------
@@ -461,6 +471,10 @@ proc = (
     .withColumn("parsed", F.from_json(F.col("binary_json").cast("string"), json_schema))
     .select(FILENAME, "parsed.*")
 )
+#proc.show()
+
+# COMMAND ----------
+
 proc.show()
 
 # COMMAND ----------
@@ -490,31 +504,44 @@ metadata_df = (
 
 # COMMAND ----------
 
-array_columns_to_bundle = ["time_millis", "microseconds", "analog"] # Include status here too, if you need status channels
-unneeded_columns = ["analog_units","status", "status_channel_names"]
+# Name some temporary columns for intermediary transformations
+_ARRAY_COLS = "_array_cols"
+_STRUCT_COL = "_struct_col"
+_ANALOG_CHANNELS_PER_TS = "_analog_channels_per_timestamp"
+_ANALOG_CHANNEL = "_analog_channel"
+
+WILDCARD = "*"
+
+
+array_columns_to_bundle = [TIME_MICRO, ANALOG] # Include status here too, if you need status channels
+unneeded_columns = [ANALOG_UNITS, STATUS, STATUS_CHANNEL_NAMES]
 pivoted_current = (
     proc
     .drop(*metadata_cols, *unneeded_columns)
     .select(
-        "*",
-        F.arrays_zip(*array_columns_to_bundle).alias("array_cols")
+        WILDCARD,
+        F.arrays_zip(*array_columns_to_bundle).alias(_ARRAY_COLS)
     )
     .drop(*array_columns_to_bundle)
-    .select("*",F.explode("array_cols").alias("struct_col"))
-    .drop("array_cols")
-    .select("*","struct_col.*")
-    .drop("struct_col")
-    .withColumn("analog_channels_per_timestamp", F.arrays_zip("analog_channel_names","analog"))
-    .drop("analog_channel_names","analog")
-    .select("*", F.explode("analog_channels_per_timestamp").alias("analog_channel"))
-    .drop("analog_channels_per_timestamp")
-    .select("*", "analog_channel.*")
-    .drop("analog_channel")
-    .filter(F.col("analog_channel_names").isin(["IA","IB","IC"])) # This will ensure we only keep these three variables
-    .groupby(FILENAME, TIME_MILLIS, TIME_MICRO)
-    .pivot("analog_channel_names",["IA","IB","IC"]) # If you don't know all the possible column names this second argument can be left blank but the computation time will take longer.
-    .agg(F.first("analog"))
+    .select(WILDCARD,F.explode(_ARRAY_COLS).alias(_STRUCT_COL))
+    .drop(_ARRAY_COLS)
+    .select(WILDCARD,f"{_STRUCT_COL}.{WILDCARD}")
+    .drop(_STRUCT_COL)
+    .withColumn(_ANALOG_CHANNELS_PER_TS, F.arrays_zip(ANALOG_CHANNEL_NAMES,ANALOG))
+    .drop(ANALOG_CHANNEL_NAMES,ANALOG)
+    .select(WILDCARD, F.explode(_ANALOG_CHANNELS_PER_TS).alias(_ANALOG_CHANNEL))
+    .drop(_ANALOG_CHANNELS_PER_TS)
+    .select(WILDCARD, f"{_ANALOG_CHANNEL}.{WILDCARD}")
+    .drop(_ANALOG_CHANNEL)
+    .filter(F.col(ANALOG_CHANNEL_NAMES).isin([IA, IB, IC])) # This will ensure we only keep these three variables
+    .groupby(FILENAME, TIME_MICRO)
+    .pivot(ANALOG_CHANNEL_NAMES,[IA, IB, IC]) # If you don't know all the possible column names this second argument can be left blank but the computation time will take longer.
+    .agg(F.first(ANALOG))
 )
+
+# COMMAND ----------
+
+display(pivoted_current)
 
 # COMMAND ----------
 
@@ -525,14 +552,14 @@ pivoted_current = (
 
 fn_to_examine = pivoted_current.select(FILENAME).distinct().limit(1).toPandas()[FILENAME].iloc[0]
 examine = pivoted_current.filter(F.col(FILENAME) == fn_to_examine).toPandas()
-sorted_examine = examine.sort_values([TIME_MILLIS,TIME_MICRO]).reset_index(drop=True)
+sorted_examine = examine.sort_values([TIME_MICRO]).reset_index(drop=True)
 
 # COMMAND ----------
 
 # Create a plot of the waveform
-plt.plot(sorted_examine["IA"])
-plt.plot(sorted_examine["IB"])
-plt.plot(sorted_examine["IC"])
+plt.plot(sorted_examine[IA])
+plt.plot(sorted_examine[IB])
+plt.plot(sorted_examine[IC])
 plt.suptitle(sorted_examine[FILENAME].iloc[0])
 plt.show()
 
@@ -543,17 +570,6 @@ plt.show()
 
 # COMMAND ----------
 
-import tensorflow as tf
-import mlflow
-from mlflow.keras import log_model
-
-# COMMAND ----------
-
-mlflow.autolog(disable=True)
-
-# COMMAND ----------
-
-TIME = "time"
 PHASE_A = "IA"
 PHASE_B = "IB"
 PHASE_C = "IC"
@@ -582,121 +598,97 @@ display(df)
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC Since it isn't too large, pull the dataset into memory as a Pandas DataFrame.
+
+# COMMAND ----------
+
 df_pd = df.toPandas()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Preprocessing
+# MAGIC Convert the Pandas DataFrame into a tensor of shape:
+# MAGIC 
+# MAGIC Data:
+# MAGIC (Number of waveforms, length of waveforms, number of channels)
+# MAGIC 
+# MAGIC Labels:
+# MAGIC (Number of waveforms, 1 if fault 0 otherwise)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Test / Train Split
+WAVEFORM_LENGTH = 726
 
-# COMMAND ----------
-
-from sklearn.model_selection import GroupShuffleSplit
-splitter = GroupShuffleSplit(test_size=0.2, n_splits=2, random_state=13)
-split = splitter.split(df_pd, groups=df_pd["filename"])
-train_inds, test_inds = next(split)
-
-train_pd = df_pd.iloc[train_inds]
-test_pd = df_pd.iloc[test_inds]
-
-print(train_pd.shape, test_pd.shape)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Standard Scaling
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC Scale the current columns on a similar range.
-
-# COMMAND ----------
-
-from sklearn.preprocessing import StandardScaler
-from sklearn.compose import ColumnTransformer
-
-scale_columns = ["IA","IB","IC"]
-features = train_pd[scale_columns]
-
-scaler = StandardScaler()
-
-scaler.fit(features)
-
-# COMMAND ----------
-
-train_scaled = train_pd.copy()
-train_scaled[scale_columns] = scaler.transform(train_scaled[scale_columns])
-test_scaled = test_pd.copy()
-test_scaled[scale_columns] = scaler.transform(test_scaled[scale_columns])
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Simple xgboost
-
-# COMMAND ----------
-
-# this clasifies a moment in time at the file index
-
-import xgboost as xgb
-from sklearn.model_selection import train_test_split
-from sklearn import metrics
-
-G_train = train_scaled.drop(columns=["filename", "is_fault","time"])
-g_train = train_scaled["is_fault"]
-G_test = test_scaled.drop(columns=["filename", "is_fault","time"])
-g_test = test_scaled["is_fault"]
-
-xgb_model = xgb.XGBClassifier(max_depth=3, subsample=0.5) # to mkae it run a little more snappy
-xgb_model.fit(G_train, g_train)
-
-g_pred = xgb_model.predict_proba(G_test)[:, 1]
-fpr, tpr, thresholds = metrics.roc_curve(g_test, g_pred, pos_label=1)
-metrics.auc(fpr, tpr)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## CNN
-
-# COMMAND ----------
-
+# Select all rows for the 3 phase current
 current_signals = df_pd.loc[:, [PHASE_A, PHASE_B, PHASE_C]]
-current_signals_tensor = tf.signal.frame(current_signals.to_numpy(), 726, 726, axis=0)
-labels_tensor = tf.signal.frame(df_pd[IS_FAULT].iloc[::726].to_numpy(), 1, 1)
+# Use signal.frame to convert to (N, 726, 3)
+current_signals_tensor = tf.signal.frame(current_signals.to_numpy(), WAVEFORM_LENGTH, WAVEFORM_LENGTH, axis=0)
+# Use signal.frame to create label tensor of shape (N, 1)
+labels_tensor = tf.signal.frame(df_pd[IS_FAULT].iloc[::WAVEFORM_LENGTH].to_numpy(), 1, 1)
+# Print the shapes
 print(current_signals_tensor.shape, labels_tensor.shape)
 
 # COMMAND ----------
 
-indices = tf.range(start=0, limit=tf.shape(current_signals_tensor)[0], dtype=tf.int32)
+# MAGIC %md
+# MAGIC Before splitting into training and test sets we need to shuffle the order of the waveforms (don't shuffle the time series of the waveforms themselves!)
+
+# COMMAND ----------
+
 tf.random.set_seed(42)
+
+# We're interested in shuffling on the 0th axis (N waveforms), get the range of indices
+indices = tf.range(start=0, limit=tf.shape(current_signals_tensor)[0], dtype=tf.int32)
+# Shuffle the indices
 shuffled_indices = tf.random.shuffle(indices)
 
+# Use gather to shuffle the data tensor and the labels tensor in the same order (so that the Nth waveform still corresponds to the Nth label)
 shuffled_signals = tf.gather(current_signals_tensor, shuffled_indices)
 shuffled_labels = tf.gather(labels_tensor, shuffled_indices)
 
 # COMMAND ----------
 
-train_signals = shuffled_signals[:480]
-train_labels = shuffled_labels[:480]
+# MAGIC %md
+# MAGIC Calculate how many waveforms should be in the training, validation, and test sets based upon a 70/15/15 split.
 
-val_signals = shuffled_signals[480:540]
-val_labels = shuffled_labels[480:540]
+# COMMAND ----------
 
-test_signals = shuffled_signals[540:]
-test_labels = shuffled_labels[540:]
+total_waveforms = shuffled_signals.shape[0]
+train_waveforms = int(total_waveforms * 0.7)
+val_waveforms = int((total_waveforms - train_waveforms) * 0.5)
+test_waveforms = total_waveforms - val_waveforms - train_waveforms
+
+print(train_waveforms, val_waveforms, test_waveforms)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Use indexing to split the waveforms into the training/validation/test sets.
+
+# COMMAND ----------
+
+train_signals = shuffled_signals[:train_waveforms]
+train_labels = shuffled_labels[:train_waveforms]
+
+val_signals = shuffled_signals[train_waveforms:train_waveforms + val_waveforms]
+val_labels = shuffled_labels[train_waveforms:train_waveforms + val_waveforms]
+
+test_signals = shuffled_signals[-test_waveforms:]
+test_labels = shuffled_labels[-test_waveforms:]
+
+print(train_signals.shape[0], val_signals.shape[0], test_signals.shape[0])
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Create a function which generates a new convolutional neural network for binary classification.
 
 # COMMAND ----------
 
 def create_convolutional_classification_model() -> tf.keras.Model:
     tf.random.set_seed(13)
-    inp = tf.keras.Input(shape=[726,3])
+    inp = tf.keras.Input(shape=[WAVEFORM_LENGTH,3])
     pipe = tf.keras.layers.Conv1D(16, 3, activation="relu", padding="same") (inp)
     pipe = tf.keras.layers.MaxPooling1D(pool_size=4) (pipe)
     pipe = tf.keras.layers.Conv1D(32,3, activation="relu", padding="same") (pipe)
@@ -708,6 +700,11 @@ def create_convolutional_classification_model() -> tf.keras.Model:
     mod = tf.keras.Model(inp,pipe)
     mod.compile(loss="binary_crossentropy", optimizer="rmsprop", metrics=["Precision","Recall"])
     return mod
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Fit the classification model to the training set. We should attempt to overfit to find the right number of epochs to use for a final fit.
 
 # COMMAND ----------
 
@@ -727,6 +724,11 @@ plt.legend()
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC Looks like we overfit to the data very quickly after around epoch 10. We could add more regularization to slow the overfit, but in our case this model is a good enough start so we'll concatenate the training and validation sets and retrain to 10 epochs.
+
+# COMMAND ----------
+
 train_val_signals = tf.concat([train_signals, val_signals],axis=0)
 train_val_labels = tf.concat([train_labels, val_labels],axis=0)
 
@@ -735,13 +737,23 @@ model2_history = model2.fit(
   x=train_val_signals, 
   y=train_val_labels, 
   batch_size=16, 
-  epochs=26
+  epochs=10
 )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Evaluate our final model against the test data set.
 
 # COMMAND ----------
 
 test_metrics = model2.evaluate(x=test_signals,y=test_labels)
 print(test_metrics)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Log the model to mlflow and transition it into Production so we can easily load it in our pipeline.
 
 # COMMAND ----------
 
